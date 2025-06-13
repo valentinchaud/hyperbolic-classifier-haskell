@@ -7,13 +7,12 @@ import qualified Data.Text.IO as T
 import Data.Map (Map)
 import qualified Data.Map as Map
 import Data.Tree
--- …
 
 -- | Part-of-speech
 data POS = Noun | Verb | Adj | Adv
   deriving (Eq, Ord, Show)
 
--- | Résultat d’index
+-- | Index entry result
 data IndexEntry = IndexEntry {
     idxLemma :: T.Text
   , idxPOS :: POS
@@ -38,21 +37,17 @@ parseIndexLine pos line =
       (lemma : _ : _ : p_cnt_str : rest) ->
           let
             p_cnt = read (T.unpack p_cnt_str) :: Int
-
-            fieldsToDrop = p_cnt + 2
-
-            offsets = drop fieldsToDrop rest
+            fieldsToDrop = p_cnt + 2  -- skip pointer fields and two more fields
+            offsets = drop fieldsToDrop rest  -- get offsets after pointer fields
           in
             IndexEntry lemma pos (map (read . T.unpack) offsets)
+      _ -> error $ "Bad format or line too short: " ++ T.unpack line
 
-      _ -> error $ "Mauvais format ou ligne trop courte: " ++ T.unpack line
-
--- 2. Charger toute la base d’index
 loadIndex :: FilePath -> POS -> IO IndexDB
 loadIndex fp pos = do
   txt <- T.readFile fp
   let rawLines = T.lines txt
-      dataLines = filter (\l -> not (l `T.isPrefixOf` "  ")) rawLines
+      dataLines = filter (\l -> not (l `T.isPrefixOf` "  ")) rawLines  -- skip comment lines
       entries  = map (parseIndexLine pos) dataLines
   return $ Map.fromList [ ((idxLemma e, idxPOS e), e) | e <- entries ]
 
@@ -60,16 +55,15 @@ parseDataLine :: POS -> T.Text -> Synset
 parseDataLine pos line =
   let
     (beforeGloss, gloss') = T.breakOn " | " line
-    gloss = T.drop 3 gloss'
+    gloss = T.drop 3 gloss'  -- remove " | " prefix
 
     parts = T.words beforeGloss
 
-    -- Lecture des champs de base
     synsetOffset = read (T.unpack $ head parts)
     wordCount    = read (T.unpack $ parts !! 3) :: Int
 
     wordFields = take (wordCount * 2) (drop 4 parts)
-    words      = [wordFields !! i | i <- [0,2..length wordFields - 1]]
+    words      = [wordFields !! i | i <- [0,2..length wordFields - 1]]  -- take every other field (the words)
 
     pCntIndex = 4 + (wordCount * 2)
     pointerCount = read (T.unpack $ parts !! pCntIndex) :: Int
@@ -77,9 +71,10 @@ parseDataLine pos line =
     ptrStartIndex = pCntIndex + 1
     pointers = [ (T.head (parts !! (ptrStartIndex + i*2)), read (T.unpack $ parts !! (ptrStartIndex + i*2 + 1)))
                | i <- [0..pointerCount - 1]
-               ]
+               ]  -- parse pointer symbol and offset pairs
 
   in Synset synsetOffset pos words pointers gloss
+
 loadData :: FilePath -> POS -> IO SynsetDB
 loadData fp pos = do
   linesData <- T.lines <$> T.readFile fp
@@ -90,11 +85,10 @@ buildHyperTree :: SynsetDB -> Synset -> Tree Synset
 buildHyperTree db syn =
   Node syn
     [ buildHyperTree db s'
-        | (sym, off) <- synPointers syn   -- bind sym here
-        , sym == '@'                      -- now you can match on it
-        , Just s' <- [Map.lookup off db]
+        | (sym, off) <- synPointers syn   -- for each pointer
+        , sym == '@'                      -- only hypernym pointers
+        , Just s' <- [Map.lookup off db]  -- lookup target synset
     ]
-
 
 main :: IO ()
 main = do
@@ -115,5 +109,3 @@ main = do
              putStrLn $ "Error: Offset " ++ show off ++ " not found in data.noun."
        [] -> do
          putStrLn $ "Warning: The word '" ++ T.unpack (idxLemma entry) ++ "' has no offsets in the database. Cannot build tree."
-
-
