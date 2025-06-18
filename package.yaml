@@ -35,20 +35,41 @@ ghc-options:
 
 library:
   source-dirs: src
-
-executables:
-  hyperbolic-classifier-parser:
-    main:                Parser.hs
-    source-dirs:         app
-    ghc-options:
-    - -threaded
-    - -rtsopts
-    - -with-rtsopts=-N
-    dependencies:
-    - hyperbolic-classifier
+  dependencies:
     - containers
     - megaparsec
     - text
+    - random
+    - mtl
+
+executables:
+  hyperbolic-classifier-tree-printer:
+    main: TreePrinter.hs
+    other-modules: [ ]
+    source-dirs: app
+    ghc-options:
+      - -threaded
+      - -rtsopts
+      - -with-rtsopts=-N
+    dependencies:
+      - hyperbolic-classifier
+      - megaparsec
+      - containers
+      - text
+  hyperbolic-classifier-distance:
+    main: DistanceCalculator.hs
+    source-dirs: app
+    other-modules: [ ]
+    ghc-options:
+      - -threaded
+      - -rtsopts
+      - -with-rtsopts=-N
+    dependencies:
+      - hyperbolic-classifier
+      - megaparsec
+      - containers
+      - text
+
 
 tests:
   hyperbolic-classifier-test:
