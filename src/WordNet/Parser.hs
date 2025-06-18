@@ -3,24 +3,27 @@
 module WordNet.Parser (
     parseIndex,
     parseData,
+    getPathToRoot,
+    formatSynset,
+    formatDebugInfo,
     loadIndex,
     loadData,
-    extractWithWarnings
+    extractWithWarnings,
+    lookupAllSynsets
   ) where
 
 import qualified Data.Text as T
 import qualified Data.Text.IO as T
 import Data.Map (Map)
 import qualified Data.Map as Map
-import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Maybe (mapMaybe)
 import Control.Exception (try, SomeException)
 import Control.Monad (when)
+
 import WordNet.Types
 
--- Helper functions are imported from WordNet.Types
-
+-- | Simple but robust index line parser
 parseIndexLine :: POS -> T.Text -> Maybe IndexEntry
 parseIndexLine pos line =
   case T.words line of
@@ -36,7 +39,6 @@ parseIndexLine pos line =
         Nothing -> Nothing
     _ -> Nothing
 
--- | Robust data line parser with error handling
 parseDataLine :: POS -> T.Text -> Maybe Synset
 parseDataLine pos line = do
   let (beforeGloss, afterSep) = T.breakOn " | " line
@@ -115,6 +117,32 @@ lookupAllSynsets word pos idx db = do
 formatSynset :: Synset -> T.Text
 formatSynset s = T.pack (show (synOffset s)) <> ": " <>
                  T.intercalate ", " (synWords s) <> " | " <> synGloss s
+
+formatDebugInfo :: T.Text -> T.Text -> DebugInfo -> T.Text
+formatDebugInfo word1 word2 debug =
+  let header = "=== Debug for: " <> word1 <> " vs " <> word2 <> " ==="
+
+      word1Section = if word1Found debug
+        then word1 <> " synsets:\n" <>
+             T.unlines ["  " <> formatSynset s | s <- debugWord1Synsets debug]
+        else word1 <> " not found in index\n"
+
+      word2Section = if word2Found debug
+        then word2 <> " synsets:\n" <>
+             T.unlines ["  " <> formatSynset s | s <- debugWord2Synsets debug]
+        else word2 <> " not found in index\n"
+
+      distanceSection = if word1Found debug && word2Found debug
+        then "\nDistances between all synset pairs:\n" <>
+             T.unlines [ "  " <> T.pack (show (synOffset s1)) <> " -> " <>
+                        T.pack (show (synOffset s2)) <> ": " <>
+                        maybe "No path" (T.pack . show) dist
+                       | (s1, s2, dist) <- allDistances debug
+                       ] <>
+             "\nMinimum distance: " <> maybe "No path" (T.pack . show) (finalDistance debug) <> "\n"
+        else ""
+
+  in T.unlines [header, word1Section, word2Section, distanceSection]
 
 -- | Helper functions for working with ParseResult in IO context
 
