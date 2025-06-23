@@ -43,6 +43,22 @@ library:
     - mtl
 
 executables:
+  dataset-generator:
+    main: DatasetGenerator.hs
+    source-dirs: app
+    other-modules: [ ]
+    ghc-options:
+      - -threaded
+      - -rtsopts
+      - -with-rtsopts=-N
+    dependencies:
+      - hyperbolic-classifier # Access to our library
+      - base
+      - text
+      - containers
+      - vector              # For efficient random access to the word list
+      - random              # For picking random words
+      - deepseq
   hyperbolic-classifier-tree-printer:
     main: TreePrinter.hs
     other-modules: [ ]

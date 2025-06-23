@@ -26,6 +26,10 @@ source-repository head
 library
   exposed-modules:
       Lib
+      WordNet
+      WordNet.Distance
+      WordNet.Parser
+      WordNet.Types
   other-modules:
       Paths_hyperbolic_classifier
   autogen-modules:
@@ -35,14 +39,43 @@ library
   ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints
   build-depends:
       base >=4.7 && <5
+    , containers
+    , megaparsec
+    , mtl
+    , random
+    , text
   default-language: Haskell2010
 
-executable hyperbolic-classifier-parser
-  main-is: Parser.hs
-  other-modules:
-      Paths_hyperbolic_classifier
-  autogen-modules:
-      Paths_hyperbolic_classifier
+executable dataset-generator
+  main-is: DatasetGenerator.hs
+  hs-source-dirs:
+      app
+  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N
+  build-depends:
+      base
+    , containers
+    , deepseq
+    , hyperbolic-classifier
+    , random
+    , text
+    , vector
+  default-language: Haskell2010
+
+executable hyperbolic-classifier-distance
+  main-is: DistanceCalculator.hs
+  hs-source-dirs:
+      app
+  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N
+  build-depends:
+      base >=4.7 && <5
+    , containers
+    , hyperbolic-classifier
+    , megaparsec
+    , text
+  default-language: Haskell2010
+
+executable hyperbolic-classifier-tree-printer
+  main-is: TreePrinter.hs
   hs-source-dirs:
       app
   ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N
