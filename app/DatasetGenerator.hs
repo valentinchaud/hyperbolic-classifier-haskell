@@ -54,64 +54,78 @@ getSynsetsForWord word idx synsetDB =
     Nothing -> []
     Just indexEntries -> mapMaybe lookupSynset indexEntries
   where
-    lookupSynset entry = Map.lookup (synOffset entry) synsetDB
+    lookupSynset entry = Map.lookup (synsetOffset entry) synsetDB
+
+-- | Get hypernym offsets from a synset's pointer list
+getHypernymOffsets :: Synset -> [SynsetOffset]
+getHypernymOffsets synset = 
+  [target | Pointer Hypernym target _ _ <- synsetPointers synset]
+
+-- | Get hyponym offsets from a synset's pointer list
+getHyponymOffsets :: Synset -> [SynsetOffset]
+getHyponymOffsets synset = 
+  [target | Pointer Hyponym target _ _ <- synsetPointers synset]
 
 -- | Get all words from a synset
 getSynsetWords :: Synset -> [T.Text]
-getSynsetWords synset = map (T.pack . word) (synWords synset)
+getSynsetWords synset = map wordForm (synsetWords synset)
 
 -- | Get all synsets from the database
 getAllSynsets :: SynsetDB -> [Synset]
 getAllSynsets = Map.elems
 
--- | Generate positive hypernym pairs using distance-based approach
--- Since we can't directly access synset pointers, we'll use a different strategy
-generatePositiveHypernymPairs :: Vector T.Text -> IndexDB -> SynsetDB -> Int -> IO [(T.Text, T.Text)]
-generatePositiveHypernymPairs allNouns idx synsetDB targetCount = do
-  printf "Generating %d positive hypernym pairs using semantic similarity...\n" targetCount
+-- | Generate positive hypernym pairs directly from synset relationships
+generatePositiveHypernymPairs :: SynsetDB -> Int -> IO [(T.Text, T.Text)]
+generatePositiveHypernymPairs synsetDB targetCount = do
+  let allSynsets = getAllSynsets synsetDB
+  printf "Generating %d positive hypernym pairs from %d synsets...\n" targetCount (length allSynsets)
   
   pairs <- newIORef []
   count <- newIORef 0
-  attempted <- newIORef 0
   
-  let maxIdx = V.length allNouns - 1
-      maxAttempts = targetCount * 10 -- Limit attempts to avoid infinite loops
-      
-      generateLoop = do
-        currentCount <- readIORef count
-        currentAttempted <- readIORef attempted
-        when (currentCount < targetCount && currentAttempted < maxAttempts) $ do
-          idx1 <- randomRIO (0, maxIdx)
-          idx2 <- randomRIO (0, maxIdx)
-          
-          let word1 = allNouns V.! idx1
-              word2 = allNouns V.! idx2
-          
-          writeIORef attempted (currentAttempted + 1)
-          
-          when (word1 /= word2) $ do
-            -- Use semantic distance to identify potential hypernym relationships
-            case calculateDistance word1 word2 idx synsetDB of
-              Just dist | dist >= 1 && dist <= 3 -> do -- Close semantic distance suggests relationship
-                -- For simplicity, assume word1 is hypernym of word2 if word1 is shorter/more general
-                let (hypernym, hyponym) = if T.length word1 <= T.length word2 
-                                         then (word1, word2) 
-                                         else (word2, word1)
-                currentPairs <- readIORef pairs
-                writeIORef pairs ((hypernym, hyponym) : currentPairs)
-                writeIORef count (currentCount + 1)
-                
-                when (currentCount `mod` 1000 == 0 && currentCount > 0) $
-                  printf "  Generated %d positive pairs...\n" currentCount
-              _ -> return ()
-          
-          generateLoop
+  -- Process each synset to find hypernym relationships
+  mapM_ (processSynsetForHypernyms synsetDB pairs count targetCount) allSynsets
   
-  generateLoop
   finalPairs <- readIORef pairs
   finalCount <- readIORef count
   printf "Generated %d positive pairs\n" finalCount
   return $ take targetCount finalPairs
+
+-- | Process a synset to extract hypernym pairs
+processSynsetForHypernyms :: SynsetDB -> IORef [(T.Text, T.Text)] -> IORef Int -> Int -> Synset -> IO ()
+processSynsetForHypernyms synsetDB pairsRef countRef targetCount synset = do
+  currentCount <- readIORef countRef
+  when (currentCount < targetCount) $ do
+    let hypernymOffsets = getHypernymOffsets synset
+        hyponymWords = getSynsetWords synset
+    
+    -- For each hypernym, create pairs with hyponym words
+    mapM_ (createHypernymPairs synsetDB pairsRef countRef targetCount hyponymWords) hypernymOffsets
+
+-- | Create hypernym pairs for a specific hypernym offset
+createHypernymPairs :: SynsetDB -> IORef [(T.Text, T.Text)] -> IORef Int -> Int -> [T.Text] -> SynsetOffset -> IO ()
+createHypernymPairs synsetDB pairsRef countRef targetCount hyponymWords hypernymOffset = do
+  currentCount <- readIORef countRef
+  when (currentCount < targetCount) $ do
+    case Map.lookup hypernymOffset synsetDB of
+      Nothing -> return ()
+      Just hypernymSynset -> do
+        let hypernymWords = getSynsetWords hypernymSynset
+        -- Create pairs: hypernym -> hyponym
+        mapM_ (addHypernymPair pairsRef countRef targetCount) 
+              [(hw, ho) | hw <- hypernymWords, ho <- hyponymWords, hw /= ho]
+
+-- | Add a hypernym pair to the collection
+addHypernymPair :: IORef [(T.Text, T.Text)] -> IORef Int -> Int -> (T.Text, T.Text) -> IO ()
+addHypernymPair pairsRef countRef targetCount pair = do
+  currentCount <- readIORef countRef
+  when (currentCount < targetCount) $ do
+    currentPairs <- readIORef pairsRef
+    writeIORef pairsRef (pair : currentPairs)
+    writeIORef countRef (currentCount + 1)
+    
+    when (currentCount `mod` 1000 == 0 && currentCount > 0) $
+      printf "  Generated %d positive pairs...\n" currentCount
 
 -- | Generate negative pairs (non-hypernym relationships)
 generateNegativeHypernymPairs :: Vector T.Text -> IndexDB -> SynsetDB -> Int -> IO [(T.Text, T.Text)]
@@ -120,41 +134,28 @@ generateNegativeHypernymPairs allNouns idx synsetDB targetCount = do
   
   pairs <- newIORef []
   count <- newIORef 0
-  attempted <- newIORef 0
   
   let maxIdx = V.length allNouns - 1
-      maxAttempts = targetCount * 5
-      
       generateLoop = do
         currentCount <- readIORef count
-        currentAttempted <- readIORef attempted
-        when (currentCount < targetCount && currentAttempted < maxAttempts) $ do
+        when (currentCount < targetCount) $ do
           idx1 <- randomRIO (0, maxIdx)
           idx2 <- randomRIO (0, maxIdx)
           
           let word1 = allNouns V.! idx1
               word2 = allNouns V.! idx2
           
-          writeIORef attempted (currentAttempted + 1)
-          
           when (word1 /= word2) $ do
-            -- Check if words are semantically distant (likely not hypernyms)
-            case calculateDistance word1 word2 idx synsetDB of
-              Just dist | dist > 5 -> do -- Large distance suggests no hypernym relationship
+            -- Check if it's NOT a hypernym relationship
+            if not (isDirectHypernym word1 word2 idx synsetDB)
+              then do
                 currentPairs <- readIORef pairs
                 writeIORef pairs ((word1, word2) : currentPairs)
                 writeIORef count (currentCount + 1)
                 
                 when (currentCount `mod` 1000 == 0 && currentCount > 0) $
                   printf "  Generated %d negative pairs...\n" currentCount
-              Nothing -> do -- No path found - definitely not hypernyms
-                currentPairs <- readIORef pairs
-                writeIORef pairs ((word1, word2) : currentPairs)
-                writeIORef count (currentCount + 1)
-                
-                when (currentCount `mod` 1000 == 0 && currentCount > 0) $
-                  printf "  Generated %d negative pairs...\n" currentCount
-              _ -> return ()
+              else return ()
           
           generateLoop
   
@@ -164,7 +165,18 @@ generateNegativeHypernymPairs allNouns idx synsetDB targetCount = do
   printf "Generated %d negative pairs\n" finalCount
   return $ take targetCount finalPairs
 
--- | Generate balanced hypernym dataset using distance-based heuristics
+-- | Check if word1 is a direct hypernym of word2 (only immediate parent)
+isDirectHypernym :: T.Text -> T.Text -> IndexDB -> SynsetDB -> Bool
+isDirectHypernym word1 word2 idx synsetDB = 
+  let synsets1 = getSynsetsForWord word1 idx synsetDB
+      synsets2 = getSynsetsForWord word2 idx synsetDB
+      offsets1 = Set.fromList $ map synsetOffset synsets1
+  in any (\synset2 -> 
+           let directHypernymOffsets = Set.fromList $ getHypernymOffsets synset2
+           in not $ Set.null $ Set.intersection offsets1 directHypernymOffsets
+         ) synsets2
+
+-- | Generate balanced hypernym dataset using synset relationships
 generateBalancedHypernymDataset :: Handle -> Vector T.Text -> IndexDB -> SynsetDB -> Int -> IO ()
 generateBalancedHypernymDataset h allNouns idx synsetDB totalPairs = do
   let targetPositive = totalPairs `div` 2
@@ -172,12 +184,11 @@ generateBalancedHypernymDataset h allNouns idx synsetDB totalPairs = do
   
   printf "Generating balanced dataset with %d total pairs\n" totalPairs
   printf "Target: %d positive + %d negative pairs\n" targetPositive targetNegative
-  printf "Note: Using distance-based heuristics for hypernym detection\n"
   
-  -- Generate positive pairs using semantic similarity
-  positivePairs <- generatePositiveHypernymPairs allNouns idx synsetDB targetPositive
+  -- Generate positive pairs using synset relationships
+  positivePairs <- generatePositiveHypernymPairs synsetDB targetPositive
   
-  -- Generate negative pairs using semantic distance
+  -- Generate negative pairs randomly
   negativePairs <- generateNegativeHypernymPairs allNouns idx synsetDB targetNegative
   
   -- Write positive pairs to file
@@ -185,14 +196,14 @@ generateBalancedHypernymDataset h allNouns idx synsetDB totalPairs = do
   mapM_ (\(hypernym, hyponym) -> do
     let line = T.concat [hypernym, ",", hyponym, ",", "1"]
     T.hPutStrLn h line
-    ) positivePairs
+  ) positivePairs
   
   -- Write negative pairs to file
   printf "Writing %d negative pairs to file...\n" (length negativePairs)
   mapM_ (\(word1, word2) -> do
     let line = T.concat [word1, ",", word2, ",", "0"]
     T.hPutStrLn h line
-    ) negativePairs
+  ) negativePairs
   
   let actualTotal = length positivePairs + length negativePairs
   printf "Dataset complete: %d positive + %d negative = %d total pairs\n" 
@@ -222,7 +233,7 @@ generateAndWriteDistancePair h allNouns idx db = do
 getNumPairs :: IO Int
 getNumPairs = do
   putStrLn "\nHow many data pairs would you like to generate? (e.g., 10000)"
-  putStrLn "Note: For hypernym dataset, pairs will be generated using distance-based heuristics"
+  putStrLn "Note: For hypernym dataset, pairs will be generated directly from WordNet synset relationships"
   putStrLn "Recommendation: 10000-100000 pairs for good coverage"
   input <- getLine
   case safeReadInt input of
@@ -279,10 +290,9 @@ main = do
     DistanceMode -> putStrLn "Dataset contains word pairs with their semantic distances."
     HypernymMode -> do
       putStrLn "Balanced dataset contains word pairs with hypernym labels:"
-      putStrLn "  - 1 = word1 IS a hypernym of word2 (estimated)"
-      putStrLn "  - 0 = word1 is NOT a hypernym of word2 (estimated)"
+      putStrLn "  - 1 = word1 IS a hypernym of word2"
+      putStrLn "  - 0 = word1 is NOT a hypernym of word2"
       putStrLn "  - Dataset is balanced: 50% positive, 50% negative examples"
-      putStrLn "  - Positive pairs estimated using semantic distance heuristics"
-      putStrLn "  - Note: This is a heuristic approach due to library limitations"
+      putStrLn "  - Positive pairs generated directly from WordNet synset relationships"
 
   printf "\nDataset generation complete. Saved to %s\n" outputFile
