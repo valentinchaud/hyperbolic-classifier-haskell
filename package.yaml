@@ -41,8 +41,26 @@ library:
     - text
     - random
     - mtl
+    - vector
 
 executables:
+  dataset-generator:
+    main: DatasetGenerator.hs
+    source-dirs: app
+    other-modules: [ ]
+    ghc-options:
+      - -threaded
+      - -rtsopts
+      - -with-rtsopts=-N
+    dependencies:
+      - hyperbolic-classifier # Access to our library
+      - base
+      - text
+      - containers
+      - vector              # For efficient random access to the word list
+      - random              # For picking random words
+      - deepseq
+
   hyperbolic-classifier-tree-printer:
     main: TreePrinter.hs
     other-modules: [ ]
@@ -73,11 +91,15 @@ executables:
 
 tests:
   hyperbolic-classifier-test:
-    main:                Spec.hs
-    source-dirs:         test
+    main: Spec.hs
+    source-dirs: test
+    other-modules: [ ]
     ghc-options:
-    - -threaded
-    - -rtsopts
-    - -with-rtsopts=-N
+      - -threaded
+      - -rtsopts
+      - -with-rtsopts=-N
     dependencies:
-    - hyperbolic-classifier
+      - hyperbolic-classifier
+      - containers
+      - text
+      - hspec  # or whatever testing framework you prefer
