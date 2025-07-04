@@ -9,10 +9,8 @@ module Main where
 
 import Torch
 import qualified Torch.NN as NN
-import Torch.Optim (GD(..), Adam, LearningRate, mkAdam, adam)
+import Torch.Optim (Adam, LearningRate, mkAdam, adam)
 import qualified Torch.Functional as F
-import Torch.Layer.MLP (MLPHypParams(..), MLPParams(..), ActName(..), mlpLayer)
-import Torch.Train (update, showLoss, sumTensors)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.List (foldl')
@@ -27,13 +25,14 @@ import Debug.Trace (trace)
 import Prelude hiding (div, sqrt, max, any, mod, abs, tanh)  -- Hide ambiguous functions from Prelude
 import qualified Prelude
 import Data.Char (toLower)
+
 -- Data types
 type WordEmbedding = Tensor
 type WordPair = (String, String)
 type Label = Bool
 type WordEmbeddingMap = Map.Map String Tensor
 
--- Simplified MLP using hasktorch-tools utilities
+-- MLP with strict fields and dropout
 data MLPSpec = MLPSpec {
     inputSize :: !Int,
     hiddenSize1 :: !Int,
@@ -45,23 +44,14 @@ data MLPSpec = MLPSpec {
 data MLP = MLP {
     linear1 :: !Linear,
     linear2 :: !Linear,
-    linear3 :: !Linear,
-    dropoutRate :: !Double
+    linear3 :: !Linear
 } deriving (Generic, Show)
 
 instance Parameterized MLP
-instance HasForward MLP Tensor Tensor where
-    forward model input = do
-        let !x1 = Torch.tanh $ linear (linear1 model) input
-        !x1_dropped <- F.dropout (dropoutRate model) True x1
-        let !x2 = Torch.tanh $ linear (linear2 model) x1_dropped
-        !x2_dropped <- F.dropout (dropoutRate model) True x2
-        let !output = sigmoid $ linear (linear3 model) x2_dropped
-        return output
 
 -- Custom NFData instance since Linear doesn't have NFData
 instance NFData MLP where
-    rnf (MLP l1 l2 l3 dr) = l1 `seq` l2 `seq` l3 `seq` dr `seq` ()
+    rnf (MLP l1 l2 l3) = l1 `seq` l2 `seq` l3 `seq` ()
 
 -- Custom NFData instance for Tensor (if not already available)
 instance NFData Tensor where
@@ -74,56 +64,55 @@ mkMLP spec = do
     linear2 <- sample $ NN.LinearSpec (hiddenSize1 spec) (hiddenSize2 spec)
     linear3 <- sample $ NN.LinearSpec (hiddenSize2 spec) (outputSize spec)
 
-    let !model = MLP linear1 linear2 linear3 (dropoutRate spec)
+    -- Use default initialization for now
+    let !model = MLP linear1 linear2 linear3
     return model
 
--- Simplified forward pass using HasForward typeclass
+-- Forward pass with dropout for training and batch normalization
 mlpForward :: MLP -> Tensor -> Bool -> Double -> IO Tensor
-mlpForward model input isTraining _ = 
-    if isTraining 
-    then forward model input
-    else do
-        -- Evaluation mode - no dropout
-        let !x1 = Torch.tanh $ linear (linear1 model) input
-        let !x2 = Torch.tanh $ linear (linear2 model) x1
-        let !output = sigmoid $ linear (linear3 model) x2
-        return output
+mlpForward model input isTraining dropRate = do
+    -- Add input normalization for stability
+    let !inputNorm = standardize input
+        !x1 = Torch.tanh $ linear (linear1 model) inputNorm  -- Use tanh instead of relu
+    !x1_dropped <- if isTraining then F.dropout dropRate True x1 else return x1
+    let !x2 = Torch.tanh $ linear (linear2 model) x1_dropped
+    !x2_dropped <- if isTraining then F.dropout dropRate True x2 else return x2
+    let !output = sigmoid $ linear (linear3 model) x2_dropped
+    return output
+  where
+    -- Simple standardization
+    standardize tensor =
+        let !mean = Torch.mean tensor
+            !variance = Torch.mean $ mul (sub tensor mean) (sub tensor mean)
+            !std = Torch.sqrt $ add variance (full' [] (1e-8 :: Float))
+        in Torch.div (sub tensor mean) std
 
--- Enhanced features with robust normalization and NaN protection
+-- FIXED: Enhanced features with proper concatenation and normalization (more stable)
 prepareEnhancedFeatures :: WordEmbedding -> WordEmbedding -> Tensor
 prepareEnhancedFeatures emb1 emb2 =
-    let -- Ensure embeddings are Float type and check for NaN/Inf
+    let -- Ensure embeddings are Float type
         !emb1_float = toType Float emb1
         !emb2_float = toType Float emb2
-        
-        -- Check for NaN/Inf in input embeddings
-        hasNaN1 = hasNaNOrInf emb1_float
-        hasNaN2 = hasNaNOrInf emb2_float
 
-        -- L2 normalize embeddings with more robust handling
-        !norm1_sq = asValue (sumAll (mul emb1_float emb1_float)) :: Float
-        !norm2_sq = asValue (sumAll (mul emb2_float emb2_float)) :: Float
-        !norm1 = Prelude.max 1e-6 (Prelude.sqrt norm1_sq)  -- Increase minimum norm
-        !norm2 = Prelude.max 1e-6 (Prelude.sqrt norm2_sq)
-        !emb1_norm = if hasNaN1 then zeros' [100] else Torch.div emb1_float (full' [] norm1)
-        !emb2_norm = if hasNaN2 then zeros' [100] else Torch.div emb2_float (full' [] norm2)
+        -- L2 normalize embeddings for better stability
+        !norm1 = Prelude.max 1e-8 (Prelude.sqrt (asValue (sumAll (mul emb1_float emb1_float)) :: Float))
+        !norm2 = Prelude.max 1e-8 (Prelude.sqrt (asValue (sumAll (mul emb2_float emb2_float)) :: Float))
+        !emb1_norm = Torch.div emb1_float (full' [] norm1)
+        !emb2_norm = Torch.div emb2_float (full' [] norm2)
 
-        -- Basic features with clipping
+        -- Basic features
         !concatenated = cat (Dim 0) [emb1_norm, emb2_norm]
-        !difference = clamp (-10.0) 10.0 $ sub emb1_norm emb2_norm  -- Clip to prevent extreme values
-        !elementwise_product = clamp (-10.0) 10.0 $ mul emb1_norm emb2_norm
+        !difference = sub emb1_norm emb2_norm
+        !elementwise_product = mul emb1_norm emb2_norm
 
-        -- Additional similarity features with safer computation
-        !dot_product = sumAll $ mul emb1_norm emb2_norm
-        !cosine_sim = reshape [1] $ clamp (-0.999) 0.999 dot_product  -- More conservative bounds
-        !diff_sq_sum = sumAll $ mul difference difference
-        !euclidean_dist = reshape [1] $ clamp 0.0 3.0 $ Torch.sqrt $ add diff_sq_sum (full' [] (1e-8 :: Float))
+        -- Additional similarity features (more conservative bounds)
+        !cosine_sim = reshape [1] $ clamp (-1.0) 1.0 $ sumAll $ mul emb1_norm emb2_norm
+        !euclidean_dist = reshape [1] $ clamp 0.0 5.0 $ Torch.sqrt $ sumAll $ mul difference difference
 
-        -- Combine all features without final normalization to avoid division issues
+        -- Combine all features and normalize the entire feature vector
         !combined = cat (Dim 0) [concatenated, difference, elementwise_product, cosine_sim, euclidean_dist]
-        
-        -- Simple clipping instead of normalization to avoid NaN
-        !result = clamp (-5.0) 5.0 combined
+        !combinedNorm = Prelude.max 1e-8 (Prelude.sqrt (asValue (sumAll (mul combined combined)) :: Float))
+        !result = Torch.div combined (full' [] combinedNorm)
     in result `seq` result
 
 -- Improved GloVe embeddings loader with better error handling
@@ -255,7 +244,7 @@ loadDataset filepath = do
                 case reads (trim labelStr) of
                     [(labelInt, "")] ->
                         let label = labelInt == (1 :: Int)
-                            cleanW1 = trim $ map toLower  w1
+                            cleanW1 = trim $ map  toLower  w1
                             cleanW2 = trim $ map toLower w2
                         in if null cleanW1 || null cleanW2
                            then (acc, errCount + 1)
@@ -274,31 +263,20 @@ splitOn delim = foldr f [[]]
                | otherwise  = (c:x) : xs
     f _ [] = []
 
--- Dataset preparation with validation and debugging
+-- Dataset preparation with validation
 prepareDataset :: WordEmbeddingMap -> [(WordPair, Label)] -> [(Tensor, Tensor)]
 prepareDataset embeddings dataset =
     let results = mapMaybe convert dataset
         totalAttempted = length dataset
         successful = length results
-        missingWords = filter (\((w1, w2), _) -> isNothing (Map.lookup w1 embeddings) || isNothing (Map.lookup w2 embeddings)) dataset
-    in Debug.Trace.trace ("Dataset conversion: " ++ show successful ++ "/" ++ show totalAttempted ++ " successful") $
-       Debug.Trace.trace ("Missing word pairs: " ++ show (length missingWords)) $
-       if length missingWords <= 10 
-       then Debug.Trace.trace ("First few missing: " ++ show (Prelude.take 5 missingWords)) results
-       else results
+    in Debug.Trace.trace ("Dataset conversion: " ++ show successful ++ "/" ++ show totalAttempted ++ " successful") results
   where
     convert ((w1, w2), label) = do
         e1 <- Map.lookup w1 embeddings
         e2 <- Map.lookup w2 embeddings
         let !features = prepareEnhancedFeatures e1 e2
             !target = asTensor ([if label then 1.0 else 0.0 :: Float] :: [Float])
-        -- Check for NaN in features
-        if hasNaNOrInf features
-        then Nothing  -- Skip examples with NaN features
-        else return (features, target)
-    
-    isNothing Nothing = True
-    isNothing (Just _) = False
+        return (features, target)
 
 splitDataset :: [(Tensor, Tensor)] -> Float -> ([(Tensor, Tensor)], [(Tensor, Tensor)])
 splitDataset dataset ratio =
@@ -306,7 +284,7 @@ splitDataset dataset ratio =
         trainN = round $ ratio * fromIntegral n
     in splitAt trainN dataset
 
--- Simplified batch utilities using hasktorch-tools
+-- Batch utils
 makeBatches :: Int -> [(Tensor, Tensor)] -> [[(Tensor, Tensor)]]
 makeBatches _ [] = []
 makeBatches bs xs = let (!b, !rest) = splitAt bs xs in b : makeBatches bs rest
@@ -314,70 +292,81 @@ makeBatches bs xs = let (!b, !rest) = splitAt bs xs in b : makeBatches bs rest
 mergeBatch :: [(Tensor, Tensor)] -> (Tensor, Tensor)
 mergeBatch batch =
     let !inputs = stack (Dim 0) (map fst batch)
-        !targets = reshape [-1] $ stack (Dim 0) (map snd batch)
+        !targets = reshape [-1] $ stack (Dim 0) (map snd batch)  -- Flatten to get right shape
     in (inputs, targets)
 
--- Create data pipeline using hasktorch-tools
-createDataPipeline :: [(Tensor, Tensor)] -> Int -> [(Tensor, Tensor)]
-createDataPipeline dataset batchSize = 
-    let batches = makeBatches batchSize dataset
-    in map mergeBatch batches
-
--- Simplified training using hasktorch-tools utilities
+-- Training with Hasktorch Adam optimizer
 trainModel :: MLP -> [(Tensor, Tensor)] -> Int -> Float -> Int -> Double -> IO MLP
 trainModel model dataset epochs lr batchSize dropRate = do
     putStrLn $ "Training with " ++ show (length dataset) ++ " examples for " ++ show epochs ++ " epochs"
     putStrLn $ "Learning rate: " ++ show lr ++ ", Batch size: " ++ show batchSize ++ ", Dropout: " ++ show dropRate
 
     let params = flattenParameters model
-        adamOptimizer = mkAdam 0 0.9 0.999 params
+        adamOptimizer = mkAdam 0 0.9 0.999 params  -- Initialize Adam with beta1=0.9, beta2=0.999
 
-    (finalModel, _) <- foldM (trainEpoch lr batchSize dataset) (model, adamOptimizer) [1..epochs]
+    (finalModel, _) <- foldM (trainEpoch lr batchSize dropRate dataset) (model, adamOptimizer) [1..epochs]
     return finalModel
 
-trainEpoch :: Float -> Int -> [(Tensor, Tensor)] -> (MLP, Adam) -> Int -> IO (MLP, Adam)
-trainEpoch lr batchSize dataset (currentModel, adamOptim) epoch = do
+trainEpoch :: Float -> Int -> Double -> [(Tensor, Tensor)] -> (MLP, Adam) -> Int -> IO (MLP, Adam)
+trainEpoch lr batchSize dropRate dataset (currentModel, adamOptim) epoch = do
     let !batches = makeBatches batchSize dataset
     (updatedModel, updatedOptim, totalLoss, batchCount) <-
-        foldM (trainBatch lr) (currentModel, adamOptim, 0.0, 0) batches
+        foldM (trainBatch lr dropRate) (currentModel, adamOptim, 0.0, 0) batches
 
     performGC
 
     let !avgLoss = if batchCount > 0 then totalLoss / fromIntegral batchCount else 0.0
     printf "Epoch %d - Avg loss: %.6f (batches: %d)\n" epoch avgLoss batchCount
 
+    -- Add more detailed debugging for first few epochs
     when (epoch <= 5) $ do
-        printf "  Learning rate: %.6f\n" lr
+        printf "  Learning rate: %.6f, Dropout: %.2f\n" lr dropRate
         printf "  Avg loss: %.6f, Batches processed: %d\n" avgLoss batchCount
         when (isNaN avgLoss || isInfinite avgLoss || avgLoss > 10.0) $
             putStrLn "  WARNING: Loss is unstable!"
 
     if isNaN avgLoss || isInfinite avgLoss then do
         putStrLn "ERROR: Loss is NaN or Infinite! Training may have diverged."
+        putStrLn "Try reducing learning rate or adding more gradient clipping."
         return (currentModel, adamOptim)
     else
         return (updatedModel, updatedOptim)
 
--- Simplified training batch using runStep utility
-trainBatch :: Float -> (MLP, Adam, Float, Int) -> [(Tensor, Tensor)] -> IO (MLP, Adam, Float, Int)
-trainBatch lr (model', adamOptim, accLoss, batchCount) batch = do
+trainBatch :: Float -> Double -> (MLP, Adam, Float, Int) -> [(Tensor, Tensor)] -> IO (MLP, Adam, Float, Int)
+trainBatch lr dropRate (model', adamOptim, accLoss, batchCount) batch = do
     let (!inputs, !targets) = mergeBatch batch
-    
-    -- Use runStep for cleaner training step
-    let lossFunc = \m -> do
-            !predictions <- forward m inputs
-            let !clampedPredictions = clamp 1e-7 (1.0 - 1e-7) $ reshape [-1] predictions
-                !clampedTargets = toType Float targets
-            return $ F.binaryCrossEntropyLoss' clampedPredictions clampedTargets
-    
-    (!newModel, !newOptim, !lossTensor) <- runStep model' adamOptim lossFunc lr
-    let !lossScalar = asValue lossTensor :: Float
+    !predictions <- mlpForward model' inputs True dropRate  -- Training mode with dropout
+
+    -- Clamp predictions to prevent extreme values in loss computation
+    let !clampedPredictions = clamp 1e-7 (1.0 - 1e-7) $ reshape [-1] predictions
+        !clampedTargets = toType Float targets
+        !lossTensor = F.binaryCrossEntropyLoss' clampedPredictions clampedTargets
+        !lossScalar = asValue lossTensor :: Float
 
     if isNaN lossScalar || isInfinite lossScalar || lossScalar > 100.0 then do
         putStrLn $ "WARNING: Bad loss in batch " ++ show (batchCount + 1) ++ ": " ++ show lossScalar
+        putStrLn $ "Predictions range: " ++ show (asValue (Torch.min clampedPredictions) :: Float, asValue (Torch.max clampedPredictions) :: Float)
+        putStrLn $ "Targets range: " ++ show (asValue (Torch.min clampedTargets) :: Float, asValue (Torch.max clampedTargets) :: Float)
         return (model', adamOptim, accLoss, batchCount + 1)
     else do
-        return (newModel, newOptim, accLoss + lossScalar, batchCount + 1)
+        lossScalar `seq` return ()
+        predictions `seq` return ()
+
+        let !params = flattenParameters model'
+            !rawGrads = grad lossTensor params
+            !clippedGrads = map (clamp (-0.5) 0.5) rawGrads
+            !gradients = Gradients clippedGrads
+
+        -- Update with Hasktorch Adam optimizer
+        let !lrTensor = asTensor (lr :: Float)
+            !paramTensors = map toDependent params
+            (!updatedTensors, !updatedOptim) = adam lrTensor gradients paramTensors adamOptim
+        !updatedParams <- mapM makeIndependent updatedTensors
+        let !newModel = replaceParameters model' updatedParams
+
+        rnf newModel `seq` return ()
+
+        return (newModel, updatedOptim, accLoss + lossScalar, batchCount + 1)
 
 -- Evaluation
 predict :: MLP -> Tensor -> IO Bool
@@ -467,7 +456,7 @@ hasNaNOrInf tensor =
 main :: IO ()
 main = do
     putStrLn "=== Loading dataset first ==="
-    !dataset <- loadDataset "train.csv"
+    !dataset <- loadDataset "hypernym_dataset.csv"
 
     when (null dataset) $ do
         putStrLn "ERROR: No dataset loaded!"
@@ -530,7 +519,7 @@ main = do
 
     putStrLn "=== Training ==="
     -- FIXED: Much better hyperparameters to prevent NaN loss
-    !trainedModel <- trainModel model train 20 0.0001 16 0.0  -- Lower LR (0.0001), smaller batch (16), no dropout
+    !trainedModel <- trainModel model train 20 0.001 32 0.1  -- Higher LR (0.001), bigger batch (32), less dropout (10%)
 
     putStrLn "=== Evaluation ==="
     !_ <- evaluateModel trainedModel test testPairs
