@@ -87,7 +87,20 @@ executables:
       - megaparsec
       - containers
       - text
-
+  mlp-training:
+    main: HypernymMLP.hs
+    source-dirs: app
+    other-modules: [ ]
+    dependencies:
+      - hyperbolic-classifier
+      - containers
+      - hasktorch
+      - binary
+      - bytestring
+      - deepseq
+      - text
+      - random
+      - data-binary-ieee754
 
 tests:
   hyperbolic-classifier-test:
