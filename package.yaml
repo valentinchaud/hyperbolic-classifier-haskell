@@ -36,6 +36,8 @@ ghc-options:
 library:
   source-dirs: src
   dependencies:
+    - hasktorch
+    - hasktorch-tools
     - containers
     - megaparsec
     - text
@@ -95,12 +97,22 @@ executables:
       - hyperbolic-classifier
       - containers
       - hasktorch
+      - hasktorch-tools
       - binary
       - bytestring
       - deepseq
       - text
       - random
       - data-binary-ieee754
+  hyperbolic-embeddings:
+    main: HyperbolicEmbeddingTest.hs
+    source-dirs: app
+    other-modules: [ ]
+    dependencies:
+      - hyperbolic-classifier
+      - hasktorch
+      - hasktorch-tools
+      - containers
 
 tests:
   hyperbolic-classifier-test:
