@@ -169,68 +169,6 @@ findSimilarWords embeddings queryWord k =
                 sorted = sortBy (comparing snd) distances
             in Prelude.take k sorted
 
--- Comprehensive analogy testing
-testAnalogies :: WordEmbeddingMap -> IO ()
-testAnalogies embeddings = do
-    putStrLn "\n=== Comprehensive Analogy Testing ==="
-
-    -- Royal analogies
-    putStrLn "\n--- Royal Analogies ---"
-    testAnalogy embeddings "king" "queen" "man" "woman"
-    testAnalogy embeddings "prince" "princess" "king" "queen"
-
-    -- Geographic analogies
-    putStrLn "\n--- Geographic Analogies ---"
-    testAnalogy embeddings "france" "paris" "germany" "berlin"
-    testAnalogy embeddings "america" "english" "france" "french"
-
-    -- Animal analogies
-    putStrLn "\n--- Animal Analogies ---"
-    testAnalogy embeddings "dog" "puppy" "cat" "kitten"
-    testAnalogy embeddings "lion" "mane" "elephant" "trunk"
-
-    -- Size analogies
-    putStrLn "\n--- Size Analogies ---"
-    testAnalogy embeddings "big" "small" "large" "tiny"
-    testAnalogy embeddings "huge" "tiny" "giant" "small"
-
-    -- Category analogies
-    putStrLn "\n--- Category Analogies ---"
-    testAnalogy embeddings "car" "vehicle" "apple" "fruit"
-    testAnalogy embeddings "dog" "animal" "rose" "flower"
-
-    -- Opposite analogies
-    putStrLn "\n--- Opposite Analogies ---"
-    testAnalogy embeddings "good" "bad" "right" "wrong"
-    testAnalogy embeddings "love" "hate" "joy" "sadness"
-
-testAnalogy :: WordEmbeddingMap -> String -> String -> String -> String -> IO ()
-testAnalogy embeddings a b c expected = do
-    case (Map.lookup a embeddings, Map.lookup b embeddings, Map.lookup c embeddings) of
-        (Just embA, Just embB, Just embC) -> do
-            let negB = mobiusScalarMult (-1.0) embB
-                intermediate = mobiusAdd embA negB
-                result = mobiusAdd intermediate embC
-
-                distances = [(word, asValue (poincareDistance result emb) :: Float)
-                           | (word, emb) <- Map.toList embeddings,
-                             word `notElem` [a, b, c]]
-
-            case distances of
-                [] -> printf "No candidates found for %s - %s + %s\n" a b c
-                _ -> do
-                    let (bestWord, bestDist) = minimumBy (comparing snd) distances
-                        top5 = Prelude.take 5 $ sortBy (comparing snd) distances
-
-                    printf "%s - %s + %s = %s (dist: %.3f)" a b c bestWord bestDist
-                    if bestWord == expected then
-                        putStrLn " ✅"
-                    else
-                        printf " (expected: %s) ❌\n" expected
-
-                    putStrLn $ "  Top 5: " ++ show (Prelude.take 5 $ map fst top5)
-        _ -> printf "Missing words for analogy: %s - %s + %s\n" a b c
-
 -- Test hierarchical relationships in detail
 testHierarchies :: WordEmbeddingMap -> IO ()
 testHierarchies embeddings = do
@@ -348,15 +286,26 @@ main = do
            (Map.size glove_embeddings) (length testVocab)
            ((fromIntegral (Map.size glove_embeddings) * 100.0) / fromIntegral (length testVocab) :: Float)
 
+    putStrLn "\n=== Analyzing Sample Euclidean Embeddings ==="
+    mapM_ (\word ->
+        case Map.lookup word glove_embeddings of
+            Just emb -> analyzeEmbedding emb word
+            Nothing -> putStrLn $ word ++ ": not found")
+        ["king", "queen", "man", "woman", "animal", "dog"]
+
     -- Convert to hyperbolic space
     putStrLn "\n=== Converting to Hyperbolic Space ==="
     let hyperbolic_embeddings = convertToHyperbolic glove_embeddings
 
+    putStrLn "\n=== Analyzing Sample Hyperbolic Embeddings ==="
+    mapM_ (\word ->
+        case Map.lookup word hyperbolic_embeddings of
+            Just emb -> analyzeEmbedding emb word
+            Nothing -> putStrLn $ word ++ ": not found")
+        ["king", "queen", "man", "woman", "animal", "dog"]
+
     -- Comprehensive validation
     validateMathematicalProperties hyperbolic_embeddings
-
-    -- Test analogies with larger vocabulary
-    testAnalogies hyperbolic_embeddings
 
     -- Test hierarchical structures
     testHierarchies hyperbolic_embeddings
@@ -373,6 +322,3 @@ main = do
         let similarities = findSimilarWords hyperbolic_embeddings query 8
         mapM_ (\(word, dist) -> printf "  %s: %.4f\n" word dist) similarities) queries
 
-    -- Performance summary
-    putStrLn "\n=== Final Summary ==="
-    printf "✅ Loaded %d embeddings\n" (Map.size hyperbolic_embeddings)

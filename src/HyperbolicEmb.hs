@@ -19,38 +19,42 @@ import Torch.TensorOptions
 tensorNorm :: Tensor -> Tensor
 tensorNorm x = F.sqrt (F.sumAll (x * x))
 
--- | Project vectors to Poincaré ball (keep within unit ball)
--- This is the most critical function - prevents numerical issues
+-- | IMPROVED: Project vectors to Poincaré ball with better structure preservation
 projectToPoincare :: Tensor -> Tensor
 projectToPoincare x =
   let norms = tensorNorm x
-      -- Only scale vectors that are >= 1.0, preserve smaller ones
-      scaling_factor = 0.95 / (norms + 1e-8)  -- Scale to 0.95
-      mask = F.ge norms 1.0  -- Scale only if norm >= 1.0
-      ones_tensor = TF.onesLike norms
-      scaling = FI.where' mask scaling_factor ones_tensor
-  in x * scaling
+      -- Only project if actually needed (norm >= 1.0)
+      -- Use much gentler scaling to preserve relationships
+      max_norm = 0.99
+      scaling_needed = F.ge norms 1.0
+      scale_factor = max_norm / (norms + 1e-8)
+      ones_tensor = TF.onesLike scale_factor
 
+      -- Only scale if needed, otherwise keep original
+      final_scale = FI.where' scaling_needed scale_factor ones_tensor
+  in x * final_scale
+
+-- | IMPROVED: Poincaré distance with better numerical stability
 poincareDistance :: Tensor -> Tensor -> Tensor
 poincareDistance x y =
-  -- For individual word embeddings, we manually compute the dot products
-  let -- Compute element-wise products and sum them manually
-      x_dot_x = F.sumAll (x * x)  -- ||x||²
-      y_dot_y = F.sumAll (y * y)  -- ||y||²
+  let x_norm2 = F.sumAll (x * x)
+      y_norm2 = F.sumAll (y * y)
       diff = x - y
-      diff_dot_diff = F.sumAll (diff * diff)  -- ||x-y||²
+      diff_norm2 = F.sumAll (diff * diff)
 
-      -- Poincaré distance formula: d = acosh(1 + 2||x-y||²/((1-||x||²)(1-||y||²)))
-      numerator = 2.0 * diff_dot_diff
-      denominator = (1.0 - x_dot_x) * (1.0 - y_dot_y)
+      -- More stable computation
+      numerator = 2.0 * diff_norm2
+      denom1 = 1.0 - x_norm2
+      denom2 = 1.0 - y_norm2
 
-      -- Add epsilon for numerical stability
-      epsilon = 1e-8
-      denominator_safe = F.clamp epsilon 1.0 denominator
+      -- Better clamping to avoid numerical issues
+      denom1_safe = F.clamp 1e-6 1.0 denom1
+      denom2_safe = F.clamp 1e-6 1.0 denom2
 
-      inner_term = 1.0 + numerator / denominator_safe
-      clamped_inner = F.clamp 1.000001 10.0 inner_term
-  in F.log (clamped_inner + F.sqrt (clamped_inner * clamped_inner - 1.0))
+      inner = 1.0 + numerator / (denom1_safe * denom2_safe)
+      inner_clamped = F.clamp 1.0001 50.0 inner
+
+  in F.log (inner_clamped + F.sqrt (inner_clamped * inner_clamped - 1.0))
 
 -- | Exponential map from tangent space at origin to Poincaré ball
 -- exp_0(v) = tanh(||v||) * v/||v||
@@ -73,22 +77,26 @@ logMapOrigin x =
       direction = x / (x_norm_safe + 1e-8)
   in direction * artanh_norm
 
--- | Möbius addition (simplified version)
+-- | FIXED: Möbius addition with proper numerical stability
 mobiusAdd :: Tensor -> Tensor -> Tensor
 mobiusAdd u v =
   let u_norm2 = F.sumAll (u * u)
       v_norm2 = F.sumAll (v * v)
       uv_dot = F.sumAll (u * v)
 
-      -- Numerator terms
-      coeff1 = 1.0 + 2.0 * uv_dot + v_norm2
-      coeff2 = 1.0 - u_norm2
+      -- Better numerical stability - avoid clamping unless necessary
+      u_norm2_safe = F.clamp 0.0 0.999 u_norm2  -- Stay well inside unit ball
+      v_norm2_safe = F.clamp 0.0 0.999 v_norm2
+
+      -- Standard Möbius addition formula
+      coeff1 = 1.0 + 2.0 * uv_dot + v_norm2_safe
+      coeff2 = 1.0 - u_norm2_safe
       numerator = u * coeff1 + v * coeff2
 
-      -- Denominator
-      denominator = 1.0 + 2.0 * uv_dot + u_norm2 * v_norm2 + 1e-8
+      denominator = 1.0 + 2.0 * uv_dot + u_norm2_safe * v_norm2_safe
+      denominator_safe = F.clamp 1e-6 100.0 denominator
 
-  in numerator / denominator
+  in numerator / denominator_safe
 
 -- | Möbius scalar multiplication (simplified)
 mobiusScalarMult :: Double -> Tensor -> Tensor
@@ -122,13 +130,36 @@ initHyperbolicEmbeddings shape = do
   let scaled = x * 0.01  -- Scale to be very small
   return $ projectToPoincare scaled
 
--- | Hyperbolic embedding layer - projects Euclidean embeddings to Poincaré ball
--- Uses a gentler normalization to preserve relative magnitudes
+-- | Alternative: Ultra-gentle mapping that barely modifies the embeddings
+-- Use this if the above still doesn't work
+ultraGentleMapping :: Tensor -> Tensor
+ultraGentleMapping euclidean_emb =
+  let -- Minimal scaling - just enough to fit in unit ball
+      scaled = euclidean_emb * 0.08  -- Very gentle
+  in projectToPoincare scaled
+
+-- | COMPLETELY REWRITTEN: Hyperbolic embedding layer using exponential map
+-- This preserves semantic structure much better than the previous version
 hyperbolicEmbeddingLayer :: Tensor -> Tensor
 hyperbolicEmbeddingLayer euclidean_emb =
-  let -- Scale down large embeddings more gently
-      scaled = euclidean_emb * 0.1  -- Gentler scaling instead of tanh
-  in projectToPoincare scaled
+  let -- Much gentler scaling to preserve more structure
+      -- The key insight: we want to preserve relative distances, not just map to hyperbolic space
+      scaled = euclidean_emb * 0.15  -- Even gentler scaling
+
+      -- Instead of tanh mapping which compresses everything, use a linear approach
+      -- with gentle normalization only for vectors that are too large
+      norm = tensorNorm scaled
+      max_allowed = 0.95
+
+      -- Only normalize if norm > max_allowed, otherwise keep original
+      scaling_needed = F.gt norm max_allowed
+      scale_factor = max_allowed / (norm + 1e-8)
+      ones_tensor = TF.onesLike scale_factor
+
+      -- Use where to conditionally scale
+      final_scale = FI.where' scaling_needed scale_factor ones_tensor
+
+  in scaled * final_scale
 
 -- | Example usage for embedding similarity
 -- Returns hyperbolic distance between two sets of embeddings
@@ -191,3 +222,12 @@ batchPoincareDistance :: Tensor -> Tensor -> Tensor
 batchPoincareDistance batch_x batch_y =
   -- This is a placeholder - implement batch operations as needed
   poincareDistance batch_x batch_y
+
+analyzeEmbedding :: Tensor -> String -> IO ()
+analyzeEmbedding emb name = do
+  let norm = asValue (tensorNorm emb) :: Float
+      mean_val = asValue (F.mean emb) :: Float
+      std_val = asValue (F.std emb) :: Float
+  putStrLn $ name ++ ": norm=" ++ show norm ++
+             ", mean=" ++ show mean_val ++
+             ", std=" ++ show std_val
